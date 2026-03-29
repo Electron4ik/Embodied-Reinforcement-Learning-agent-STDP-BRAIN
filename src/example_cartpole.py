@@ -73,7 +73,17 @@ class CartPole:
         done = (abs(self.x)     > MAX_POS or
                 abs(self.theta) > MAX_ANGLE)
 
-        reward = 1.0 if not done else -10.0
+        # Dense reward — мозг видит направление к улучшению, не только жив/мертв
+        reward = (
+            1.0
+            - 0.8 * abs(self.theta)    / MAX_ANGLE
+            - 0.2 * abs(self.x)        / MAX_POS
+            - 0.05 * abs(self.theta_dot) / 5.0
+            - 0.02 * abs(self.x_dot)   / 5.0
+        )
+        if done:
+            reward -= 5.0
+
         return self._obs(), reward, done
 
 

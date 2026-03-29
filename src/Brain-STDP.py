@@ -83,6 +83,13 @@ class Brain:
         self.n_outputs = n_outputs
         self.seed      = seed
 
+        self.value = 0.0
+        self.value_lr = 0.05
+
+        self.energy = 1.0
+        self.energy_decay = 0.0005
+        self.energy_gain = 0.01
+
         rng = np.random.default_rng(seed)
 
         # Размеры
@@ -235,7 +242,13 @@ class Brain:
         self.pre_trace[fired]   += 1.0
 
         # Reward-modulated STDP — только internal×internal
-        mod = self.dopamine - self.pain
+        mod = (self.dopamine - self.pain) * (0.5 + self.energy)
+
+        # если мозг ничего не понял — не учимся
+        if abs(mod) < 0.01:
+            return
+
+
         if abs(mod) > 0.05:
             f_int  = self.spikes_f[int_s]          # (NIN,) float32
             pt_int = self.pre_trace[int_s]          # (NIN,) float64
@@ -253,6 +266,12 @@ class Brain:
         # Затухание модуляторов
         self.dopamine *= self._k_mod
         self.pain     *= self._k_mod
+
+
+
+        activity_cost = np.sum(self.spikes_f) * self.energy_decay
+        self.energy -= activity_cost
+        self.energy = max(0.0, self.energy)
 
     # ── Публичный API ────────────────────────────────────
 
@@ -289,15 +308,31 @@ class Brain:
         value > 0: хорошо (дофамин)
         value < 0: плохо (боль/кортизол)
         value = 0: нейтрально
-        """
-        self.total_rewards += value
 
-        if value > 0:
-            self._apply_reward(self._last_winner, correct_direction=+1, magnitude=value)
-            self.dopamine += D_REWARD * min(value, 1.0)
-        elif value < 0:
-            self._apply_reward(self._last_winner, correct_direction=-1, magnitude=-value)
-            self.pain += P_PUNISH * min(-value, 1.0)
+        Обновляет внутреннюю оценку value и модуляторы, а также запускает обучение.
+        Если он ошибся (value < self.value), то усиливает синапсы, которые привели к этому действию, и ослабляет остальные. Если он прав, то наоборот.
+        Temporal Difference Learning
+        """
+
+        self.energy += self.energy_gain * value
+        self.energy = np.clip(self.energy, 0.0, 1.0)
+
+        prediction_error = value - self.value
+        self.value += self.value_lr * prediction_error
+
+        # модуляторы теперь = ошибка, а не сам reward
+        if prediction_error > 0:
+            self.dopamine += D_REWARD * prediction_error
+
+        else:
+            self.pain += P_PUNISH * (-prediction_error)
+
+        # обучение остаётся, но с magnitude = |ошибка|
+        self._apply_reward(
+            self._last_winner,
+            correct_direction=1 if prediction_error > 0 else -1,
+            magnitude=abs(prediction_error)
+        )
 
     def reset(self):
         """Сбросить состояние нейронов между эпизодами (веса сохраняются)."""
@@ -361,7 +396,12 @@ class Brain:
         OUT_S   = self.OUT_START
 
         # Активность входов за этот step (накоплена в _tick)
-        in_act  = self.in_accum / max(self.in_accum.max(), 1.0)
+        #in_act  = self.in_accum / max(self.in_accum.max(), 1.0)
+        in_act = self.in_accum.copy()
+        in_act /= max(in_act.max(), 1.0)
+
+        # фильтр слабых сигналов
+        in_act[in_act < 0.2] = 0.0
 
         # Активность internal нейронов — берём из pre_trace (след свежей активности)
         int_act = self.pre_trace[NI:NI+NIN]
