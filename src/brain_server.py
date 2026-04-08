@@ -1,74 +1,65 @@
 """
-Brain Server v0.3
+Brain Server v0.4
 =================
-Спайковый мозг как TCP сервис.
+Архитектурный рефактор. Не смена коэффициентов.
 
-Новое в v0.3:
-  - Eligibility traces — мозг помнит что привело к результату
-  - Per-action value baseline — стабильное TD обучение
-  - Weight decay — убирает мусор, даёт долгую память
-  - Confidence freeze — не ломает то что работает
-  - Energy система — внутренняя мотивация
+Что изменилось:
+  - Прямой input→output ослаблен: выход опирается в основном на internal
+  - Dual traces: короткий (шаг) + длинный (эпизод)
+  - State-based critic по реальным признакам
+  - Асимметричные апдейты с hard clip
+  - Stochastic выбор с затуханием exploration
+  - Чистая архитектура без мёртвых полей
 
 Запуск:
-    python brain_server.py --inputs 4 --outputs 2
+    python brain_server.py --inputs 6 --outputs 2
 
-Протокол (JSON строки, \\n разделитель):
-    Клиент → {"type": "step",   "inputs": [0.1, -0.5, 0.03, 0.8]}
-    Сервер → {"type": "action", "output": 1, "confidence": 0.72}
-    Клиент → {"type": "reward", "value": 1.0}
-    Клиент → {"type": "reset"}
-    Клиент → {"type": "save",   "path": "brain.pkl"}
-    Клиент → {"type": "load",   "path": "brain.pkl"}
-    Клиент → {"type": "info"}
-    Сервер → {"type": "ok"} | {"type": "error", "msg": "..."}
+Протокол: JSON lines, \\n разделитель.
 """
 
-import argparse
-import json
-import pickle
-import socket
-import threading
+import argparse, json, pickle, socket, threading
 import numpy as np
-from collections import deque
-
 
 # ═══════════════════════════════════════════════════════
 #  ПАРАМЕТРЫ СЕТИ
 # ═══════════════════════════════════════════════════════
 
-DT              = 0.25    # шаг симуляции, мс
-TAU_M           = 15.0   # постоянная утечки мембраны
+DT              = 0.5
+TAU_M           = 20.0   # чуть длиннее — нейроны помнят вход дольше
 V_THRESH        = 1.0
 V_RESET         = 0.0
 REFRAC          = 5
-NOISE_AMP       = 0.05
+NOISE_AMP       = 0.008
 
-INPUT_RATE_HI   = 0.20
-INPUT_RATE_LO   = 0.005
+INPUT_RATE_HI   = 0.25
+INPUT_RATE_LO   = 0.003
 
 NEURONS_PER_IN  = 5
 NEURONS_PER_OUT = 10
-INTERNAL_MULT   = 8
+INTERNAL_MULT   = 6      # разумный баланс: не слишком мало, не огромный резервуар
 
 # ── Обучение ─────────────────────────────────────────
-LR              = 0.02
-LR_STDP         = 0.008
-LR_CRITIC       = 0.01   # state critic learning rate
-TAU_PRE         = 20.0
-TAU_ELIG        = 2250.0
-TAU_MOD         = 500.0 # модуляторы затухают медленнее, чем eligibility, чтобы сохранять мотивацию между эпизодами
-D_REWARD        = 2.0
-P_PUNISH        = 0.7
-W_MAX           = 4.0
+LR              = 0.015  # медленно и стабильно
+LR_STDP         = 0.005
+LR_CRITIC       = 0.008
+TAU_PRE         = 25.0
+
+# Dual traces
+TAU_SHORT       = 40.0   # короткий след — привязка к ближайшему reward
+TAU_LONG        = 200.0  # длинный след — устойчивое закрепление стратегии
+
+TAU_MOD         = 40.0
+D_REWARD        = 1.5
+P_PUNISH        = 0.5    # боль значительно мягче награды
+W_MAX           = 3.0
 W_MIN_IO        = 0.0
-GAMMA           = 0.98   # discount factor для TD critic
-# W_DECAY убран — он стирал выученные паттерны быстрее чем они закреплялись
 
-TICKS_PER_STEP  = 80
+TICKS_PER_STEP  = 25     # чуть больше — лучше интегрирует сигнал
 
-# ── Energy ───────────────────────────────────────────
-ENERGY_GAIN     = 0.01
+# ── Exploration decay ────────────────────────────────
+EXPLORE_START   = 0.8    # начальная температура softmax
+EXPLORE_MIN     = 0.1    # минимальная — почти argmax
+EXPLORE_DECAY   = 0.9998 # медленно убывает с опытом
 
 
 # ═══════════════════════════════════════════════════════
@@ -85,7 +76,7 @@ class Brain:
 
         ni      = n_inputs  * NEURONS_PER_IN
         no      = n_outputs * NEURONS_PER_OUT
-        nin     = max(160, ni * INTERNAL_MULT)
+        nin     = max(120, ni * INTERNAL_MULT)
         nin_exc = int(nin * 0.8)
         nin_inh = nin - nin_exc
 
@@ -100,78 +91,92 @@ class Brain:
         self.INH_START = ni + nin_exc
         self.INH_END   = ni + nin
 
-        # Нейроны
+        # ── Состояние ────────────────────────────────
         self.V        = np.zeros(self.NT)
         self.refrac   = np.zeros(self.NT, dtype=int)
-        self.trace    = np.zeros(self.NT)
+        self.trace    = np.zeros(self.NT)       # визуализация
         self.spikes   = np.zeros(self.NT, dtype=bool)
         self.spikes_f = np.zeros(self.NT, dtype=np.float32)
 
-        # Синапсы
-        self.W        = self._init_weights(rng)
-        self.conn     = self.W != 0
-        self._dW_buf  = np.zeros((nin, nin), dtype=np.float32)
+        # ── Синапсы ──────────────────────────────────
+        self.W    = self._init_weights(rng)
+        self.conn = self.W != 0
+        self._dW_buf = np.zeros((nin, nin), dtype=np.float32)
 
-        # Входы
+        # ── Входы / выходы ───────────────────────────
         self.input_rates = np.full(ni, INPUT_RATE_LO)
         self.in_accum    = np.zeros(ni)
         self.out_counts  = np.zeros(no)
 
-        # Traces
+        # ── Pre-trace (STDP) ─────────────────────────
         self.pre_trace = np.zeros(self.NT)
+        self._k_pre    = np.exp(-DT / TAU_PRE)
 
-        # Eligibility traces — (n_outputs, ni+nin)
-        # E_out[i] = след активности который привёл к выбору класса i
-        # Затухает между step()-вызовами, накапливается в течение эпизода
-        self.E_out   = np.zeros((n_outputs, ni + nin))
-        self._k_elig = np.exp(-DT * TICKS_PER_STEP / TAU_ELIG)
+        # ── Dual eligibility traces ──────────────────
+        # short: быстрое затухание, привязка к ближайшему reward
+        # long:  медленное, закрепляет стратегию между эпизодами
+        feat_size    = ni + nin
+        self.E_short = np.zeros((n_outputs, feat_size))
+        self.E_long  = np.zeros((n_outputs, feat_size))
+        self._k_short = np.exp(-DT * TICKS_PER_STEP / TAU_SHORT)
+        self._k_long  = np.exp(-DT * TICKS_PER_STEP / TAU_LONG)
 
-        # State critic — линейный оценщик ценности состояния
-        # Вместо per-action baseline использует реальные признаки состояния
-        # feat = [in_act, int_act] — вектор длиной NI+NIN
-        self.critic_w  = np.zeros(ni + nin)
-        self.last_feat = np.zeros(ni + nin)
+        # ── Memory (leaky integrator) ─────────────────
+        self.memory = np.zeros(ni)
+
+        # ── State critic ─────────────────────────────
+        self.critic_w  = np.zeros(feat_size)
+        self.last_feat = np.zeros(feat_size)
         self.last_v    = 0.0
 
-        # Модуляторы
+        # ── Exploration ──────────────────────────────
+        self.explore_temp = EXPLORE_START
+
+        # ── Модуляторы ───────────────────────────────
         self.dopamine = 0.0
         self.pain     = 0.0
         self._k_mod   = np.exp(-DT / TAU_MOD)
-        self._k_pre   = np.exp(-DT / TAU_PRE)
 
-        # Energy
-        self.energy = 1.0
-
-        # Стат
+        # ── Стат ─────────────────────────────────────
         self.total_steps   = 0
         self.total_rewards = 0.0
         self._last_winner  = 0
         self._last_conf    = 0.0
 
+    # ── Веса ─────────────────────────────────────────
+
     def _init_weights(self, rng):
         NI, NIN, NO = self.NI, self.NIN, self.NO
+        NT    = self.NT
         OUT_S = self.OUT_START
         INH_S = self.INH_START
         INH_E = self.INH_END
-        W     = np.zeros((self.NT, self.NT))
+        W     = np.zeros((NT, NT))
 
-        m = rng.random((NIN, NI)) < 0.25
-        W[NI:NI+NIN, :NI] = rng.uniform(0.10, 0.35, (NIN, NI)) * m
+        # Input → Internal (30%) — основной путь сигнала
+        m = rng.random((NIN, NI)) < 0.30
+        W[NI:NI+NIN, :NI] = rng.uniform(0.15, 0.45, (NIN, NI)) * m
 
-        m = rng.random((NIN, NIN)) < 0.05
+        # Internal Exc → Internal (8%) — рекуррентная динамика
+        m = rng.random((NIN, NIN)) < 0.08
         np.fill_diagonal(m, False)
-        W[NI:NI+NIN, NI:NI+NIN] = rng.uniform(0.01, 0.08, (NIN, NIN)) * m
+        W[NI:NI+NIN, NI:NI+NIN] = rng.uniform(0.02, 0.10, (NIN, NIN)) * m
 
-        m = rng.random((NIN, self.NIN_INH)) < 0.20
-        W[NI:NI+NIN, INH_S:INH_E] = -rng.uniform(0.10, 0.30, (NIN, self.NIN_INH)) * m
+        # Internal Inh → Internal (25%)
+        m = rng.random((NIN, self.NIN_INH)) < 0.25
+        W[NI:NI+NIN, INH_S:INH_E] = -rng.uniform(0.12, 0.35, (NIN, self.NIN_INH)) * m
 
-        m = rng.random((NO, NI)) < 0.45
-        W[OUT_S:, :NI] = rng.uniform(0.05, 0.20, (NO, NI)) * m
+        # Internal → Output (20%) — главный путь к решению
+        # Намеренно СИЛЬНЕЕ чем input→output
+        m = rng.random((NO, NIN)) < 0.20
+        W[OUT_S:, NI:NI+NIN] = rng.uniform(0.08, 0.22, (NO, NIN)) * m
 
-        m = rng.random((NO, NIN)) < 0.10
-        W[OUT_S:, NI:NI+NIN] = rng.uniform(0.02, 0.10, (NO, NIN)) * m
+        # Input → Output (15%) — ОСЛАБЛЕН: рефлекс не должен доминировать
+        m = rng.random((NO, NI)) < 0.15
+        W[OUT_S:, :NI] = rng.uniform(0.02, 0.08, (NO, NI)) * m
 
-        lat = 0.30
+        # Lateral inhibition между output группами
+        lat = 0.35
         for i in range(self.n_outputs):
             for j in range(self.n_outputs):
                 if i == j: continue
@@ -181,6 +186,8 @@ class Brain:
 
         np.fill_diagonal(W, 0)
         return W
+
+    # ── Тик ──────────────────────────────────────────
 
     def _tick(self):
         NI    = self.NI
@@ -216,19 +223,20 @@ class Brain:
         self.pre_trace        *= self._k_pre
         self.pre_trace[fired] += 1.0
 
-        # STDP internal×internal
-        mod = (self.dopamine - self.pain) * (0.5 + self.energy)
+        # STDP internal×internal — только при активном модуляторе
+        mod = (self.dopamine - self.pain)
         if abs(mod) > 0.05:
             np.outer(self.spikes_f[int_s], self.pre_trace[int_s], out=self._dW_buf)
             self._dW_buf *= LR_STDP * mod
             self._dW_buf *= self.conn[int_s, int_s]
             self.W[int_s, int_s] += self._dW_buf
             self.W[int_s, INH_S:INH_E] = -np.abs(self.W[int_s, INH_S:INH_E])
-            self.W[int_s, int_s] *= 0.99995
             np.clip(self.W[int_s, int_s], -W_MAX, W_MAX, out=self.W[int_s, int_s])
 
         self.dopamine *= self._k_mod
         self.pain     *= self._k_mod
+
+    # ── Публичный API ────────────────────────────────
 
     def step(self, inputs: list) -> tuple:
         assert len(inputs) == self.n_inputs, \
@@ -240,6 +248,9 @@ class Brain:
             s = i * NEURONS_PER_IN
             self.input_rates[s:s+NEURONS_PER_IN] = rates[i]
 
+        # Memory injection
+        self.input_rates += self.memory * 0.12
+
         self.out_counts[:] = 0.0
         self.in_accum[:]   = 0.0
 
@@ -248,41 +259,46 @@ class Brain:
 
         self.input_rates[:] = INPUT_RATE_LO
 
+        # Обновляем память
+        in_norm = self.in_accum / max(self.in_accum.max(), 1.0)
+        self.memory = 0.88 * self.memory + 0.12 * in_norm
+
         action, confidence = self._read_output()
 
-        # Eligibility: затухание + добавление текущей активности
-        # Взвешиваем на (0.5 + confidence) — уверенный выбор оставляет более сильный след
-        self.E_out *= self._k_elig
+        # Dual eligibility traces
+        self.E_short *= self._k_short
+        self.E_long  *= self._k_long
+
         in_act  = self.in_accum / max(self.in_accum.max(), 1.0)
         int_act = self.pre_trace[self.NI:self.NI+self.NIN]
         int_act = int_act / max(int_act.max(), 1.0)
         feat    = np.concatenate([in_act, int_act])
-        self.E_out[action] += feat * (0.5 + confidence)
 
-        # Critic: запоминаем признаки и оценку состояния для TD update в reward()
+        # Уверенный выбор оставляет более сильный след
+        weight = 0.4 + confidence * 0.6
+        self.E_short[action] += feat * weight
+        self.E_long[action]  += feat * weight * 0.3
+
+        # Critic
         self.last_feat = feat.copy()
         self.last_v    = float(self.critic_w @ feat)
 
-        self.total_steps += 1
-        self._last_conf   = confidence
+        self.total_steps  += 1
+        self._last_conf    = confidence
         return action, confidence
 
     def reward(self, value: float):
         """
-        Actor-Critic TD обучение с асимметричным клипингом.
-        Позитивные ошибки усиливают агрессивнее, негативные — мягче.
-        Это предотвращает разрушение выученного после одной ошибки.
+        TD error → асимметричный апдейт через dual traces.
+        Позитивные: усиляем через оба трейса.
+        Негативные: только через короткий и очень мягко.
         """
         self.total_rewards += value
-        self.energy = float(np.clip(self.energy + ENERGY_GAIN * value, 0.0, 1.0))
 
         td_error = value - self.last_v
+        # Hard clip: один мисс не должен разнести всю стратегию
+        td_error = float(np.clip(td_error, -2.5, 3.0))
 
-        # Асимметричный клипинг: успех может быть большим, провал — ограничен
-        # Без этого один мисс после серии поймок разносит всю стратегию
-        td_error = float(np.clip(td_error, -0.8, 2.0))
-
-        # Critic обновляется только на значимых ошибках
         if abs(td_error) > 0.01:
             self.critic_w += LR_CRITIC * td_error * self.last_feat
 
@@ -291,10 +307,18 @@ class Brain:
         else:
             self.pain += P_PUNISH * min(-td_error, 2.0)
 
-        self._apply_reward_elig(td_error)
+        self._apply_reward(td_error)
+
+        # Exploration decay — постепенно переходим к exploitation
+        self.explore_temp = max(EXPLORE_MIN,
+                                self.explore_temp * EXPLORE_DECAY)
 
     def reset(self):
-        """Сброс нейронного состояния. Веса живут дальше. E_out частично сохраняется."""
+        """
+        Сброс между эпизодами.
+        Короткий трейс — жёсткий сброс (не переносим мусор).
+        Длинный трейс — ослабляем, но не убиваем (стратегия живёт).
+        """
         self.V[:]          = 0.0
         self.refrac[:]     = 0
         self.trace[:]      = 0.0
@@ -303,35 +327,42 @@ class Brain:
         self.spikes_f[:]   = 0.0
         self.out_counts[:] = 0.0
         self.in_accum[:]   = 0.0
-        # E_out не сбрасываем полностью — мозг помнит что работало между эпизодами
-        # Но приглушаем на 30% чтобы старые ошибки не накапливались бесконечно
-        self.E_out *= 0.70
+        self.memory[:]     = 0.0
+
+        self.E_short[:] = 0.0      # короткий — полный сброс
+        self.E_long  *= 0.60       # длинный — ослабляем, стратегия остаётся
 
     def save(self, path: str):
+        import pickle
         with open(path, 'wb') as f:
             pickle.dump({
-                'n_inputs':  self.n_inputs,
-                'n_outputs': self.n_outputs,
-                'seed':      self.seed,
-                'W':         self.W,
-                'critic_w':  self.critic_w,
-                'E_out':     self.E_out,
-                'stats': {'total_steps': self.total_steps,
-                          'total_rewards': self.total_rewards}
+                'n_inputs':    self.n_inputs,
+                'n_outputs':   self.n_outputs,
+                'seed':        self.seed,
+                'W':           self.W,
+                'critic_w':    self.critic_w,
+                'E_long':      self.E_long,
+                'explore':     self.explore_temp,
+                'stats':       {'total_steps':   self.total_steps,
+                                'total_rewards': self.total_rewards}
             }, f)
 
     @classmethod
     def load(cls, path: str) -> 'Brain':
+        import pickle
         with open(path, 'rb') as f:
-            data = pickle.load(f)
-        b = cls(data['n_inputs'], data['n_outputs'], data['seed'])
-        b.W          = data['W']
-        b.conn       = b.W != 0
-        b.critic_w   = data.get('critic_w', b.critic_w)
-        b.E_out      = data.get('E_out', b.E_out)
-        b.total_steps   = data['stats']['total_steps']
-        b.total_rewards = data['stats']['total_rewards']
+            d = pickle.load(f)
+        b = cls(d['n_inputs'], d['n_outputs'], d['seed'])
+        b.W            = d['W']
+        b.conn         = b.W != 0
+        b.critic_w     = d.get('critic_w',  b.critic_w)
+        b.E_long       = d.get('E_long',    b.E_long)
+        b.explore_temp = d.get('explore',   b.explore_temp)
+        b.total_steps  = d['stats']['total_steps']
+        b.total_rewards = d['stats']['total_rewards']
         return b
+
+    # ── Внутренние ───────────────────────────────────
 
     def _read_output(self) -> tuple:
         counts = self.out_counts.reshape(self.n_outputs, NEURONS_PER_OUT).sum(axis=1)
@@ -342,72 +373,57 @@ class Brain:
             self._last_winner = w
             return w, 0.0
 
-        # Stochastic action selection — softmax с температурой
-        # Чем меньше уверенность в прошлый раз — тем больше исследование
-        temp = max(0.15, 1.0 - self._last_conf)
+        # Softmax с затухающей температурой
+        temp   = self.explore_temp
         logits = counts / (temp + 1e-8)
-        logits -= logits.max()          # стабилизация softmax
+        logits -= logits.max()
         probs  = np.exp(logits)
         probs /= probs.sum()
+
         w  = int(np.random.choice(self.n_outputs, p=probs))
         cf = float(counts[w] / total)
         self._last_winner = w
         return w, cf
 
-    def _apply_reward_elig(self, prediction_error: float):
-        """
-        Обновление весов через eligibility traces.
-
-        Асимметрия: негативные апдейты слабее позитивных.
-        Confidence freeze: уверенный правильный ответ меняется слабее.
-        """
+    def _apply_reward(self, td_error: float):
         OUT_S  = self.OUT_START
         NI     = self.NI
         NIN    = self.NIN
         winner = self._last_winner
 
-        magnitude = abs(prediction_error)
-
-        # 1. Защита от "переучивания" (Confidence Freeze)
-        if prediction_error > 0 and self._last_conf > 0.85:
-            magnitude *= 0.2  # Если и так всё хорошо, почти не трогаем веса
-        
-        # 2. Асимметрия: разрушать сложнее, чем строить
-        if prediction_error < 0:
-            magnitude *= 0.4  # Штраф мягче, чтобы не стереть память за один раз
-
-        if magnitude < 1e-5: return
-
-        # Подготовка дельты и шума для борьбы с клонированием
-        # (Создаем матрицу шума под размер группы нейронов выхода)
-        noise = np.random.uniform(0.7, 1.3, size=(NEURONS_PER_OUT, NI + NIN))
-        delta = LR * magnitude * self.E_out[winner][None, :] * noise
+        magnitude = abs(td_error)
+        # Confidence freeze: не ломаем то что работает
+        if td_error > 0 and self._last_conf > 0.75:
+            magnitude *= 0.25
+        if magnitude < 1e-4:
+            return
 
         w_s = OUT_S + winner * NEURONS_PER_OUT
         w_e = w_s + NEURONS_PER_OUT
 
-        if prediction_error > 0:
-            # Усиливаем победителя
+        if td_error > 0:
+            # Усиляем через оба трейса: short (текущее) + long (стратегия)
+            elig = self.E_short[winner] + 0.5 * self.E_long[winner]
+            elig = np.clip(elig, 0, None)   # только положительный вклад
+            delta = LR * magnitude * elig[None, :]
             self.W[w_s:w_e, :NI+NIN] += delta
-            # Ослабляем проигравших (контрастное обучение)
+            # Конкурентов ослабляем мягко
             for other in range(self.n_outputs):
                 if other == winner: continue
                 o_s = OUT_S + other * NEURONS_PER_OUT
                 o_e = o_s + NEURONS_PER_OUT
-                self.W[o_s:o_e, :NI+NIN] -= delta * 0.3 
+                elig_o = self.E_short[other]
+                self.W[o_s:o_e, :NI+NIN] -= LR * magnitude * 0.3 * elig_o[None, :]
         else:
-            # Наказываем за ошибку
+            # Негативный апдейт: берем short, но цепляем немного long, 
+            # чтобы наказывать саму неверную стратегию
+            elig  = self.E_short[winner] + 0.2 * self.E_long[winner]
+            delta = LR * magnitude * 0.8 * elig[None, :]
             self.W[w_s:w_e, :NI+NIN] -= delta
-            # Даем шанс другим (чуть-чуть подталкиваем их веса вверх)
-            for other in range(self.n_outputs):
-                if other == winner: continue
-                o_s = OUT_S + other * NEURONS_PER_OUT
-                o_e = o_s + NEURONS_PER_OUT
-                self.W[o_s:o_e, :NI+NIN] += delta * 0.2
 
-        # Ограничиваем веса, чтобы мозг не "взорвался"
-        np.clip(self.W[OUT_S:, :NI], W_MIN_IO, W_MAX, out=self.W[OUT_S:, :NI])
-        np.clip(self.W[OUT_S:, NI:NI+NIN], -W_MAX, W_MAX, out=self.W[OUT_S:, NI:NI+NIN])
+        # Клипинг
+        np.clip(self.W[OUT_S:, :NI],       W_MIN_IO, W_MAX, out=self.W[OUT_S:, :NI])
+        np.clip(self.W[OUT_S:, NI:NI+NIN], -W_MAX,   W_MAX, out=self.W[OUT_S:, NI:NI+NIN])
 
     def info(self) -> dict:
         return {
@@ -419,8 +435,8 @@ class Brain:
             'total_rewards': round(self.total_rewards, 2),
             'dopamine':      round(self.dopamine, 3),
             'pain':          round(self.pain, 3),
-            'energy':        round(self.energy, 3),
             'critic_v':      round(self.last_v, 3),
+            'explore':       round(self.explore_temp, 4),
         }
 
 
@@ -429,7 +445,7 @@ class Brain:
 # ═══════════════════════════════════════════════════════
 
 class BrainServer:
-    def __init__(self, brain: Brain, host: str = '127.0.0.1', port: int = 7777):
+    def __init__(self, brain: Brain, host='127.0.0.1', port=7777):
         self.brain    = brain
         self.host     = host
         self.port     = port
@@ -441,10 +457,12 @@ class BrainServer:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
         srv.listen(8)
-        print(f"[Brain v0.3] {self.host}:{self.port}")
-        print(f"[Brain] {self.brain.n_inputs} входов → {self.brain.n_outputs} выходов")
-        print(f"[Brain] {self.brain.NT} нейронов, {np.count_nonzero(self.brain.W)} синапсов")
-        print(f"[Brain] Eligibility TAU={TAU_ELIG}ms  LR={LR}  Critic LR={LR_CRITIC}\n")
+        b = self.brain
+        print(f"[Brain v0.4] {self.host}:{self.port}")
+        print(f"  inputs={b.n_inputs} outputs={b.n_outputs}")
+        print(f"  neurons={b.NT}  synapses={np.count_nonzero(b.W)}")
+        print(f"  explore={b.explore_temp:.3f}  LR={LR}  LR_critic={LR_CRITIC}")
+        print(f"  dual traces: short={TAU_SHORT}ms long={TAU_LONG}ms\n")
         try:
             while self._running:
                 srv.settimeout(1.0)
@@ -452,7 +470,7 @@ class BrainServer:
                     conn, addr = srv.accept()
                 except socket.timeout:
                     continue
-                print(f"[Brain] + {addr[0]}:{addr[1]}")
+                print(f"  + {addr[0]}:{addr[1]}")
                 threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
         except KeyboardInterrupt:
             print("\n[Brain] Стоп.")
@@ -480,55 +498,48 @@ class BrainServer:
         except (ConnectionResetError, BrokenPipeError):
             pass
         finally:
-            print(f"[Brain] - {addr[0]}:{addr[1]}")
+            print(f"  - {addr[0]}:{addr[1]}")
             conn.close()
 
     def _dispatch(self, msg: dict) -> dict:
         t = msg.get('type')
-
         if t == 'step':
             with self._lock:
                 action, conf = self.brain.step(msg['inputs'])
             return {'type': 'action', 'output': action, 'confidence': round(conf, 4)}
-
         elif t == 'reward':
             with self._lock:
                 self.brain.reward(float(msg['value']))
             return {'type': 'ok'}
-
         elif t == 'reset':
             with self._lock:
                 self.brain.reset()
             return {'type': 'ok'}
-
         elif t == 'save':
             path = msg.get('path', 'brain_save.pkl')
             with self._lock:
                 self.brain.save(path)
-            print(f"[Brain] Сохранено: {path}")
+            print(f"  saved: {path}")
             return {'type': 'ok', 'path': path}
-
         elif t == 'load':
             path = msg['path']
             with self._lock:
                 loaded = Brain.load(path)
                 if loaded.n_inputs != self.brain.n_inputs or \
                    loaded.n_outputs != self.brain.n_outputs:
-                    return {'type': 'error',
-                            'msg': f'Несовместимо: {loaded.n_inputs}→{loaded.n_outputs}'}
-                self.brain.W                = loaded.W
-                self.brain.conn             = loaded.conn
-                self.brain.critic_w = loaded.critic_w
-                self.brain.E_out            = loaded.E_out
-                self.brain.total_steps      = loaded.total_steps
-                self.brain.total_rewards    = loaded.total_rewards
-            print(f"[Brain] Загружено: {path}")
+                    return {'type': 'error', 'msg': 'Несовместимая конфигурация'}
+                self.brain.W            = loaded.W
+                self.brain.conn         = loaded.conn
+                self.brain.critic_w     = loaded.critic_w
+                self.brain.E_long       = loaded.E_long
+                self.brain.explore_temp = loaded.explore_temp
+                self.brain.total_steps  = loaded.total_steps
+                self.brain.total_rewards = loaded.total_rewards
+            print(f"  loaded: {path}")
             return {'type': 'ok', 'path': path}
-
         elif t == 'info':
             with self._lock:
                 return {'type': 'info', **self.brain.info()}
-
         return {'type': 'error', 'msg': f'Неизвестный тип: {t!r}'}
 
 
@@ -538,7 +549,7 @@ class BrainServer:
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
-    p.add_argument('--inputs',  type=int, default=4)
+    p.add_argument('--inputs',  type=int, default=6)
     p.add_argument('--outputs', type=int, default=2)
     p.add_argument('--host',    type=str, default='127.0.0.1')
     p.add_argument('--port',    type=int, default=7777)
