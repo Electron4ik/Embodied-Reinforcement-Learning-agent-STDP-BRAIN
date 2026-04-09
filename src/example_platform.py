@@ -36,21 +36,19 @@ class BrainClient:
     def save(self, p):     self._send({'type': 'save', 'path': p})
     def info(self):        return self._send({'type': 'info'})
 
-
 # ── Физика ───────────────────────────────────────────
 class Ball:
     GRAVITY = 900.0
     def __init__(self, x, vy_init=80.0):
         self.x  = float(x)
         self.y  = 50.0
-        self.vx = 0.0 # Можно добавить рандом для сложности позже
+        self.vx = 0.0 
         self.vy = vy_init
 
     def update(self, dt):
         self.vy += self.GRAVITY * dt
         self.x  += self.vx * dt
         self.y  += self.vy * dt
-
 
 # ── Главный цикл ─────────────────────────────────────
 def main():
@@ -64,126 +62,152 @@ def main():
     pygame.init()
     W, H = 800, 750
     screen = pygame.display.set_mode((W, H), vsync=1)
-    pygame.display.set_caption("Catcher v4 — Target Logic")
+    pygame.display.set_caption("RL Catcher | Synchronized FrameSkip")
     clock  = pygame.time.Clock()
     font   = pygame.font.SysFont("consolas", 18)
 
     PADDLE_HW = 90.0
+    PADDLE_H  = 16.0
     PADDLE_Y  = H - 70.0
-    SPEED     = 700.0 # Чуть быстрее, чтобы успевал
+    SPEED     = 700.0 
     BALL_R    = 20
+    FRAME_SKIP = 5 # Каждые 5 кадров запрашиваем новое решение
 
     def new_ball(ep):
-        x = 120 + ((ep * 173) % (W - 240))
-        return Ball(x)
+        # Мяч всегда в центре для теста "обучаемости покою"
+        return Ball(W / 2.0)
 
     player_x = W / 2.0
     episode  = 0
     score, streak, best = 0, 0, 0
     ball = new_ball(episode)
-
-    # Параметры Frame Skip
-    skip_frames = 4  
-    frame_counter = 0
-    last_action = 0
+    
+    # Состояние для синхронизации
+    frames_passed = 0
+    accumulated_reward = 0.0
+    last_action = 2 # По умолчанию стоим
     last_conf = 0.0
 
     try:
         while True:
             dt = min(clock.tick(60) / 1000.0, 0.033)
-            frame_counter += 1
 
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT: return
 
-            # 1. Считаем предсказание точки падения
+            # 1. Предсказание точки падения
             dy_left = max(PADDLE_Y - ball.y, 1.0)
             t_impact = dy_left / max(ball.vy, 10.0)
             pred_x = ball.x + ball.vx * t_impact
+            target_x = float(np.clip(pred_x, PADDLE_HW, W - PADDLE_HW))
 
-            # 2. Логика нейронки (раз в N кадров)
-            if frame_counter >= skip_frames:
-                rel_x = (ball.x - player_x) / W
-                dist_norm = abs(rel_x)
-                ball_vx = float(np.clip(ball.vx / 600.0, -1, 1))
-                ball_vy = float(np.clip(ball.vy / 1800.0, 0, 1))
-                t_norm = float(np.clip(t_impact / 3.0, 0, 1))
-                pred_rel_x = float(np.clip((pred_x - player_x) / W, -1, 1))
+            # 2. Формируем наблюдения (State)
+            rel_x = (ball.x - player_x) / W
+            dist_norm = abs(rel_x)
+            ball_vx = float(np.clip(ball.vx / 600.0, -1, 1))
+            ball_vy = float(np.clip(ball.vy / 1800.0, 0, 1))
+            t_norm = float(np.clip(t_impact / 3.0, 0, 1))
+            pred_rel_x = float(np.clip((pred_x - player_x) / W, -1, 1))
+            obs = [rel_x, ball_vx, ball_vy, t_norm, pred_rel_x, dist_norm]
 
-                obs = [rel_x, ball_vx, ball_vy, t_norm, pred_rel_x, dist_norm]
+            # 3. Синхронное взаимодействие с мозгом (Frame Skip)
+            if frames_passed == 0:
+                # Отправляем накопленную за прошлые 5 кадров награду ПЕРЕД новым шагом
+                # (Если это самый первый кадр игры, награда 0)
+                brain.reward(accumulated_reward)
+                accumulated_reward = 0.0
+                
+                # Запрашиваем новое действие
                 last_action, last_conf = brain.step(obs)
-                frame_counter = 0
 
-            # 3. Движение
+            # 4. Движение (согласно последнему выбранному действию)
             old_player_x = player_x
-            if last_action == 0: player_x -= SPEED * dt
-            else: player_x += SPEED * dt
+            if last_action == 0: player_x -= SPEED * dt # Влево
+            elif last_action == 1: player_x += SPEED * dt # Вправо
+            # action == 2 -> ничего не делаем (стоим)
+            
             player_x = float(np.clip(player_x, PADDLE_HW, W - PADDLE_HW))
 
-            # 4. Расчет награды за сближение с ТОЧКОЙ УДАРА
-            old_error = abs(pred_x - old_player_x)
-            new_error = abs(pred_x - player_x)
-            # Награда за каждый шаг в правильном направлении
-            step_reward = (old_error - new_error) / W * 5.0
+            # 5. Позиционная награда за кадр
+            dist_to_target = abs(target_x - player_x)
+            # Награда за близость к центру падения
+            # step_rew = 0.05 * (1.0 - (dist_to_target / (W/2))) # сейчас награда даже не бывает отрицательной, что нужно сделать?
+            step_rew = 0.1 * (1.0 - (dist_to_target / (W/2))) - 0.05 * (dist_to_target / (W/2)) # так награда будет отрицательной, если далеко от цели
             
-            # Микро-штраф за стояние у стены, только если он пытается ехать сквозь неё
+            # Штраф за "залипание" в стену
             if old_player_x == player_x and (player_x <= PADDLE_HW or player_x >= W - PADDLE_HW):
-                step_reward -= 0.005
+                step_rew -= 0.02
+            
+            accumulated_reward += step_rew
 
+            # 6. Физика
             ball.update(dt)
             
             done = False
-            total_reward = step_reward
-
-            # Проверка финала эпизода
-            if (PADDLE_Y - 15 < ball.y < PADDLE_Y + 20 and abs(ball.x - player_x) < PADDLE_HW):
+            # Проверка: Поймал?
+            if (PADDLE_Y - 15 < ball.y < PADDLE_Y + PADDLE_H + 5 and abs(ball.x - player_x) < PADDLE_HW):
                 acc = 1.0 - (abs(ball.x - player_x) / PADDLE_HW)
-                total_reward += 15.0 * max(0.1, acc) # Жирный бонус за центр платформы
+                accumulated_reward += 5.0 * max(0.2, acc) 
                 streak += 1
-                score += 1
                 best = max(best, streak)
                 done = True
-                print(f"Ep {episode:5d} | ✓ Catch! Streak: {streak} Acc: {acc:.2f}")
+                print(f"Ep {episode:5d} | ✓ Catch! Streak: {streak} Acc: {acc:.2f} Conf: {last_conf:.2f}")
             
+            # Проверка: Уронил?
             elif ball.y > H + 30:
-                total_reward -= 5.0 # "Не смертельный" штраф
+                accumulated_reward -= 1.0
                 streak = 0
-                score = 0
                 done = True
                 print(f"Ep {episode:5d} | ✗ Miss... Best: {best}")
 
-            brain.reward(total_reward)
-
             if done:
+                # В конце эпизода ВСЕГДА шлем финальную награду
+                brain.reward(accumulated_reward)
+                accumulated_reward = 0.0
+                frames_passed = 0
                 episode += 1
                 brain.reset()
                 ball = new_ball(episode)
                 if episode % 50 == 0:
                     brain.save(f'brain_catcher_ep{episode}.pkl')
-                    info = brain.info()
+            else:
+                # Считаем кадры до следующего запроса нейронки
+                frames_passed = (frames_passed + 1) % FRAME_SKIP
 
             # ── Рендер ──────────────────────────────────
-            screen.fill((10, 12, 20))
-            # Линия до цели
-            pygame.draw.line(screen, (50, 50, 80), (int(ball.x), int(ball.y)), (int(pred_x), int(PADDLE_Y)), 1)
+            screen.fill((5, 15, 5) if streak > 0 else (20, 5, 5)) 
+
+            # Линия до предсказаынной цели
+            pygame.draw.line(screen, (50, 50, 80), (int(ball.x), int(ball.y)), (int(target_x), int(PADDLE_Y)), 1)
+            pygame.draw.circle(screen, (255, 200, 0), (int(ball.x), int(ball.y)), BALL_R)
             pygame.draw.circle(screen, (255, 200, 0), (int(ball.x), int(ball.y)), BALL_R)
             
-            # Платформа
-            rect_color = (100, 255, 100) if streak > 0 else (200, 200, 200)
-            pygame.draw.rect(screen, rect_color, (int(player_x - PADDLE_HW), int(PADDLE_Y), int(PADDLE_HW*2), 15), 2)
+            # Зона поимки (визуальная подсказка)
 
-            # Текст
+            pygame.draw.line(screen, (30, 40, 30), (int(target_x - PADDLE_HW*0.6), int(PADDLE_Y+5)),
+                                                   (int(target_x + PADDLE_HW*0.6), int(PADDLE_Y+5)), 4)
+
+            # Платформа
+            rect_color = (100, 255, 100) if accumulated_reward > 0 else (255, 255, 255)
+            pygame.draw.rect(screen, rect_color, (int(player_x - PADDLE_HW), int(PADDLE_Y), int(PADDLE_HW*2), int(PADDLE_H)), 2)
+
+            # Отрисовка текста
+            act_name = ["LEFT", "RIGHT", "STAY"][last_action] if last_action < 3 else "???"
             status = [
-                f"Episode: {episode} | Streak: {streak} | Best: {best}",
-                f"Input: {last_action} ({'Left' if last_action==0 else 'Right'}) Conf: {last_conf:.2f}",
-                f"Reward: {total_reward:+.4f}"
+                f"Episode: {episode} | Best: {best}",
+                f"Action: {act_name} | Conf: {last_conf:.2f}",
+                f"Streak: {streak} | FrameCounter: {frames_passed}",
+                f"Reward: {accumulated_reward:.3f}"
             ]
             for i, line in enumerate(status):
-                screen.blit(font.render(line, True, (150, 150, 170)), (10, 10 + i*22))
+                screen.blit(font.render(line, True, (200, 200, 200)), (10, 10 + i*22))
 
             pygame.display.flip()
 
-    except Exception as e: print(f"Критическая ошибка: {e}")
+    except Exception as e: 
+        print(f"Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         brain.close()
         pygame.quit()

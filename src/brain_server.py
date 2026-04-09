@@ -29,7 +29,7 @@ TAU_M           = 20.0   # чуть длиннее — нейроны помня
 V_THRESH        = 1.0
 V_RESET         = 0.0
 REFRAC          = 5
-NOISE_AMP       = 0.008
+NOISE_AMP       = 0.008 
 
 INPUT_RATE_HI   = 0.25
 INPUT_RATE_LO   = 0.003
@@ -59,7 +59,7 @@ TICKS_PER_STEP  = 25     # чуть больше — лучше интегрир
 # ── Exploration decay ────────────────────────────────
 EXPLORE_START   = 0.8    # начальная температура softmax
 EXPLORE_MIN     = 0.1    # минимальная — почти argmax
-EXPLORE_DECAY   = 0.9998 # медленно убывает с опытом
+EXPLORE_DECAY   = 0.995 # медленно убывает с опытом
 
 
 # ═══════════════════════════════════════════════════════
@@ -269,9 +269,12 @@ class Brain:
         self.E_short *= self._k_short
         self.E_long  *= self._k_long
 
-        in_act  = self.in_accum / max(self.in_accum.max(), 1.0)
+        #in_act  = self.in_accum / max(self.in_accum.max(), 1.0)
+        #int_act = self.pre_trace[self.NI:self.NI+self.NIN]
+        #int_act = int_act / max(int_act.max(), 1.0)
+        in_act  = self.in_accum / TICKS_PER_STEP
         int_act = self.pre_trace[self.NI:self.NI+self.NIN]
-        int_act = int_act / max(int_act.max(), 1.0)
+        int_act = int_act / max(int_act.max(), 1.0) # Правильная нормализация аналогового трейса
         feat    = np.concatenate([in_act, int_act])
 
         # Уверенный выбор оставляет более сильный след
@@ -319,6 +322,8 @@ class Brain:
         Короткий трейс — жёсткий сброс (не переносим мусор).
         Длинный трейс — ослабляем, но не убиваем (стратегия живёт).
         """
+        self.dopamine = 0.0
+        self.pain = 0.0
         self.V[:]          = 0.0
         self.refrac[:]     = 0
         self.trace[:]      = 0.0
@@ -402,28 +407,39 @@ class Brain:
         w_e = w_s + NEURONS_PER_OUT
 
         if td_error > 0:
-            # Усиляем через оба трейса: short (текущее) + long (стратегия)
+            # 1. Сначала ОДИН РАЗ обновляем победителя (усиливаем то, что сработало)
             elig = self.E_short[winner] + 0.5 * self.E_long[winner]
-            elig = np.clip(elig, 0, None)   # только положительный вклад
-            delta = LR * magnitude * elig[None, :]
-            self.W[w_s:w_e, :NI+NIN] += delta
-            # Конкурентов ослабляем мягко
+            elig = np.clip(elig, 0, None)
+            
+            # Уверенный апдейт победителя
+            delta_winner = LR * magnitude * elig[None, :]
+            self.W[w_s:w_e, :NI+NIN] += delta_winner * self.conn[w_s:w_e, :NI+NIN]
+
+            # 2. Теперь проходим по конкурентам и ОДИН РАЗ их ослабляем
             for other in range(self.n_outputs):
                 if other == winner: continue
+                
                 o_s = OUT_S + other * NEURONS_PER_OUT
                 o_e = o_s + NEURONS_PER_OUT
+                
                 elig_o = self.E_short[other]
-                self.W[o_s:o_e, :NI+NIN] -= LR * magnitude * 0.3 * elig_o[None, :]
+                # Ослабляем конкурентов, чтобы выбор winner стал более явным
+                self.W[o_s:o_e, :NI+NIN] -= LR * magnitude * 0.3 * elig_o[None, :] * self.conn[o_s:o_e, :NI+NIN]
+
         else:
-            # Негативный апдейт: берем short, но цепляем немного long, 
-            # чтобы наказывать саму неверную стратегию
-            elig  = self.E_short[winner] + 0.2 * self.E_long[winner]
-            delta = LR * magnitude * 0.8 * elig[None, :]
-            self.W[w_s:w_e, :NI+NIN] -= delta
+            # 3. Наказание (td_error <= 0)
+            # Берем меньше long_trace, чтобы один промах не убивал всю стратегию
+            elig = self.E_short[winner] + 0.1 * self.E_long[winner] 
+            delta_penalty = LR * magnitude * 0.8 * elig[None, :]
+            
+            # ВАЖНО: здесь тоже нужна маска conn!
+            self.W[w_s:w_e, :NI+NIN] -= delta_penalty * self.conn[w_s:w_e, :NI+NIN]
 
         # Клипинг
-        np.clip(self.W[OUT_S:, :NI],       W_MIN_IO, W_MAX, out=self.W[OUT_S:, :NI])
-        np.clip(self.W[OUT_S:, NI:NI+NIN], -W_MAX,   W_MAX, out=self.W[OUT_S:, NI:NI+NIN])
+        #np.clip(self.W[OUT_S:, :NI],       W_MIN_IO, W_MAX, out=self.W[OUT_S:, :NI])
+        #np.clip(self.W[OUT_S:, NI:NI+NIN], -W_MAX,   W_MAX, out=self.W[OUT_S:, NI:NI+NIN])
+        np.clip(self.W[OUT_S:, :NI], 0.0, W_MAX, out=self.W[OUT_S:, :NI])
+        np.clip(self.W[OUT_S:, NI:NI+NIN], -W_MAX, W_MAX, out=self.W[OUT_S:, NI:NI+NIN])
 
     def info(self) -> dict:
         return {
