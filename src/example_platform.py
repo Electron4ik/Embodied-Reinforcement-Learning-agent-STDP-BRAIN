@@ -1,6 +1,8 @@
-import sys, json, socket, math
+import sys, json, socket, gif_pygame, math
 import pygame
 import numpy as np
+
+gif = gif_pygame.load("brain.gif") 
 
 # ── BrainClient ──────────────────────────────────────
 class BrainClient:
@@ -155,7 +157,7 @@ def main():
             
             # Проверка: Уронил?
             elif ball.y > H + 30:
-                accumulated_reward -= 1.0
+                accumulated_reward -= 1.2
                 streak = 0
                 done = True
                 print(f"Ep {episode:5d} | ✗ Miss... Best: {best}")
@@ -168,6 +170,9 @@ def main():
                 episode += 1
                 brain.reset()
                 ball = new_ball(episode)
+                # ball.x = W / 2.0 + np.random.uniform(-300, 300) # Немного рандома в начальной позиции, но нужно чтобы мяч не был в центре, а ближе к краям:
+                ball.x = W / 2.0 + (PADDLE_HW + 50) * np.random.choice([-1, 1]) # Рандомно слева или справа от центра, но не в центре
+                
                 if episode % 50 == 0:
                     brain.save(f'brain_catcher_ep{episode}.pkl')
             else:
@@ -175,11 +180,12 @@ def main():
                 frames_passed = (frames_passed + 1) % FRAME_SKIP
 
             # ── Рендер ──────────────────────────────────
-            screen.fill((5, 15, 5) if streak > 0 else (20, 5, 5)) 
+            # screen.fill((5, 15, 5) if streak > 0 else (20, 5, 5)) 
+            screen.fill((0, 0, 0))
+            gif.render(screen, ((W-gif.get_width())*0.5, (H-gif.get_height())*0.5))
 
             # Линия до предсказаынной цели
-            pygame.draw.line(screen, (50, 50, 80), (int(ball.x), int(ball.y)), (int(target_x), int(PADDLE_Y)), 1)
-            pygame.draw.circle(screen, (255, 200, 0), (int(ball.x), int(ball.y)), BALL_R)
+            pygame.draw.line(screen, (255, 255, 255), (int(ball.x), int(ball.y)), (int(target_x), int(PADDLE_Y)), 1)
             pygame.draw.circle(screen, (255, 200, 0), (int(ball.x), int(ball.y)), BALL_R)
             
             # Зона поимки (визуальная подсказка)
@@ -188,11 +194,11 @@ def main():
                                                    (int(target_x + PADDLE_HW*0.6), int(PADDLE_Y+5)), 4)
 
             # Платформа
-            rect_color = (100, 255, 100) if accumulated_reward > 0 else (255, 255, 255)
+            rect_color = (100, 255, 100) if accumulated_reward > 0 else (255, 100, 100)
             pygame.draw.rect(screen, rect_color, (int(player_x - PADDLE_HW), int(PADDLE_Y), int(PADDLE_HW*2), int(PADDLE_H)), 2)
 
             # Отрисовка текста
-            act_name = ["LEFT", "RIGHT", "STAY"][last_action] if last_action < 3 else "???"
+            act_name = ["LEFT ", "RIGHT", "STAY "][last_action] if last_action < 3 else "???"
             status = [
                 f"Episode: {episode} | Best: {best}",
                 f"Action: {act_name} | Conf: {last_conf:.2f}",
