@@ -110,7 +110,8 @@ def main():
             ball_vy = float(np.clip(ball.vy / 1800.0, 0, 1))
             t_norm = float(np.clip(t_impact / 3.0, 0, 1))
             pred_rel_x = float(np.clip((pred_x - player_x) / W, -1, 1))
-            obs = [rel_x, ball_vx, ball_vy, t_norm, pred_rel_x, dist_norm]
+            #obs = [rel_x, ball_vx, ball_vy, t_norm, pred_rel_x, dist_norm]
+            obs = [rel_x, ball_vy, t_norm]
 
             # 3. Синхронное взаимодействие с мозгом (Frame Skip)
             if frames_passed == 0:

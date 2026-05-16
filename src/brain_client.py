@@ -67,14 +67,15 @@ class BrainClient:
         resp = self._send({'type': 'step', 'inputs': list(inputs)})
         return resp['output'], resp['confidence']
 
-    def reward(self, value: float):
-        """
-        Передать награду за последнее действие.
-          value > 0 → дофамин (хорошо)
-          value < 0 → боль (плохо)
-          value = 0 → нейтрально
-        """
-        self._send({'type': 'reward', 'value': float(value)})
+    def reward(self, v, next_obs=None, terminal=False):
+        msg = {
+            'type': 'reward',
+            'value': float(v),
+            'terminal': bool(terminal)
+        }
+        if next_obs is not None:
+            msg['next_inputs'] = [float(x) for x in next_obs]
+        self._send(msg)
 
     def reset(self):
         """Сбросить состояние нейронов. Веса обучения сохраняются."""
